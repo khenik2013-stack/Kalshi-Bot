@@ -66,7 +66,7 @@ def trade():
 
     path = "/portfolio/orders"
     url = KALSHI_BASE_URL + path
-
+    
     payload = {
         "ticker": KALSHI_MARKET_TICKER,
         "action": "buy",
