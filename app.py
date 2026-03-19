@@ -1,58 +1,11 @@
 import os
-import time
-import uuid
-import base64
 import requests
-from urllib.parse import urlparse
 from flask import Flask, request, jsonify
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
 
 app = Flask(__name__)
 
-KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2").rstrip("/")
-KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
-KALSHI_PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM")
+KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
 KALSHI_SERIES_PREFIX = os.getenv("KALSHI_SERIES_PREFIX", "KXBTC15M")
-
-KALSHI_COUNT = int(os.getenv("KALSHI_COUNT", "1"))
-KALSHI_YES_PRICE = int(os.getenv("KALSHI_YES_PRICE", "50"))
-KALSHI_NO_PRICE = int(os.getenv("KALSHI_NO_PRICE", "50"))
-KALSHI_TIME_IN_FORCE = os.getenv("KALSHI_TIME_IN_FORCE", "fill_or_kill")
-
-def load_private_key():
-    if not KALSHI_PRIVATE_KEY_PEM:
-        raise RuntimeError("Missing KALSHI_PRIVATE_KEY_PEM")
-
-    pem = KALSHI_PRIVATE_KEY_PEM.replace("\\n", "\n").strip()
-
-    return serialization.load_pem_private_key(
-        pem.encode("utf-8"),
-        password=None
-    )
-
-private_key = load_private_key()
-
-def kalshi_headers(method: str, endpoint_path: str):
-    timestamp_ms = str(int(time.time() * 1000))
-    sign_path = urlparse(KALSHI_BASE_URL + endpoint_path).path
-    message = timestamp_ms + method.upper() + sign_path
-
-    signature = private_key.sign(
-        message.encode("utf-8"),
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH
-        ),
-        hashes.SHA256()
-    )
-
-    return {
-        "Content-Type": "application/json",
-        "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
-        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
-        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
-    }
 
 def get_current_btc_15m_ticker():
     url = f"{KALSHI_BASE_URL}/markets"
@@ -94,77 +47,25 @@ def get_current_btc_15m_ticker():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "ok": True
-    })
+    return jsonify({"ok": True})
 
 @app.route("/trade", methods=["POST"])
 def trade():
-    if not KALSHI_API_KEY_ID:
-        return jsonify({
-            "ok": False,
-            "error": "Missing KALSHI_API_KEY_ID"
-        }), 500
-
     data = request.get_json(force=True) or {}
-    action = data.get("action")
-
-    if action not in {"buy_yes", "buy_no"}:
-        return jsonify({
-            "ok": False,
-            "error": "Invalid action"
-        }), 400
 
     try:
         market_ticker = get_current_btc_15m_ticker()
+        return jsonify({
+            "ok": True,
+            "received": data,
+            "used_ticker": market_ticker
+        })
     except Exception as e:
         return jsonify({
             "ok": False,
             "error": f"Could not find live ticker: {str(e)}"
         }), 500
 
-    endpoint_path = "/portfolio/orders"
-    url = KALSHI_BASE_URL + endpoint_path
-
-    payload = {
-        "ticker": market_ticker,
-        "action": "buy",
-        "side": "yes" if action == "buy_yes" else "no",
-        "count": KALSHI_COUNT,
-        "client_order_id": str(uuid.uuid4()),
-        "time_in_force": KALSHI_TIME_IN_FORCE
-    }
-
-    if action == "buy_yes":
-        payload["yes_price"] = KALSHI_YES_PRICE
-    else:
-        payload["no_price"] = KALSHI_NO_PRICE
-
-    try:
-        headers = kalshi_headers("POST", endpoint_path)
-        resp = requests.post(url, json=payload, headers=headers, timeout=8)
-
-        try:
-            body = resp.json()
-        except Exception:
-            body = {"raw": resp.text}
-
-        return jsonify({
-            "ok": resp.ok,
-            "status_code": resp.status_code,
-            "used_ticker": market_ticker,
-            "sent_payload": payload,
-            "kalshi_response": body
-        }), (200 if resp.ok else 500)
-
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "used_ticker": market_ticker,
-            "sent_payload": payload,
-            "error": f"Order request failed: {str(e)}"
-        }), 500
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
