@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 import base64
 import time
 import uuid
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -13,7 +14,6 @@ KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://demo-api.kalshi.co/trade
 KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
 KALSHI_MARKET_TICKER = os.getenv("KALSHI_MARKET_TICKER")
 
-# Optional: set fixed prices and contract count
 KALSHI_COUNT = int(os.getenv("KALSHI_COUNT", "1"))
 KALSHI_YES_PRICE = int(os.getenv("KALSHI_YES_PRICE", "50"))
 KALSHI_NO_PRICE = int(os.getenv("KALSHI_NO_PRICE", "50"))
@@ -27,9 +27,13 @@ if private_key_pem:
         password=None
     )
 
-def kalshi_headers(method: str, path: str):
+def kalshi_headers(method: str, endpoint_path: str):
     timestamp_ms = str(int(time.time() * 1000))
-    message = timestamp_ms + method.upper() + path
+
+    # Kalshi wants the FULL URL path from root for signing
+    sign_path = urlparse(KALSHI_BASE_URL + endpoint_path).path
+    message = timestamp_ms + method.upper() + sign_path
+
     signature = private_key.sign(
         message.encode("utf-8"),
         padding.PSS(
@@ -39,6 +43,7 @@ def kalshi_headers(method: str, path: str):
         hashes.SHA256()
     )
     signature_b64 = base64.b64encode(signature).decode("utf-8")
+
     return {
         "Content-Type": "application/json",
         "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
@@ -64,9 +69,9 @@ def trade():
     if action not in {"buy_yes", "buy_no"}:
         return jsonify({"ok": False, "error": "Invalid action"}), 400
 
-    path = "/portfolio/orders"
-    url = KALSHI_BASE_URL + path
-    
+    endpoint_path = "/portfolio/orders"
+    url = KALSHI_BASE_URL + endpoint_path
+
     payload = {
         "ticker": KALSHI_MARKET_TICKER,
         "action": "buy",
@@ -81,7 +86,7 @@ def trade():
     else:
         payload["no_price"] = KALSHI_NO_PRICE
 
-    headers = kalshi_headers("POST", path)
+    headers = kalshi_headers("POST", endpoint_path)
     resp = requests.post(url, json=payload, headers=headers, timeout=20)
 
     try:
