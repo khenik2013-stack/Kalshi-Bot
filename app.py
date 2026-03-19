@@ -8,6 +8,10 @@ import time
 import uuid
 from urllib.parse import urlparse
 
+print("Starting Kalshi request")
+resp = requests.post(url, json=payload, headers=headers, timeout=8)
+print("Finished Kalshi request", resp.status_code)
+
 app = Flask(__name__)
 
 KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://demo-api.kalshi.co/trade-api/v2")
@@ -104,3 +108,7 @@ def trade():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
+print("Starting Kalshi request")
+resp = requests.post(url, json=payload, headers=headers, timeout=8)
+print("Finished Kalshi request", resp.status_code)
