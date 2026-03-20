@@ -13,15 +13,13 @@ app = Flask(__name__)
 
 BASE = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2").rstrip("/")
 KEY_ID = os.getenv("KALSHI_API_KEY_ID")
-KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM", "").replace("\\n", "\n").strip()
+KEY_PEM_RAW = os.getenv("KALSHI_PRIVATE_KEY_PEM", "")
 SERIES = os.getenv("KALSHI_SERIES_PREFIX", "KXBTC15M")
 
-BUY_MAX_COST_CENTS = 1000  # $10 max per 15m bucket
+BUY_MAX_COST_CENTS = 1000
 
-PRIVATE_KEY = serialization.load_pem_private_key(
-    KEY_PEM.encode(),
-    password=None
-)
+KEY_PEM = KEY_PEM_RAW.replace("\\n", "\n").strip()
+PRIVATE_KEY = serialization.load_pem_private_key(KEY_PEM.encode(), password=None)
 
 STATE = {
     "bucket": None,
@@ -68,7 +66,7 @@ def get_current_ticker():
     markets.sort(key=lambda x: x.get("close_time", "9999"))
     return markets[0]["ticker"]
 
-def get_implied_ask_cents(ticker: str, side: str) -> int:
+def get_implied_ask_cents(ticker: str, side: str):
     r = requests.get(f"{BASE}/markets/{ticker}/orderbook", timeout=5)
     r.raise_for_status()
     data = r.json()
@@ -78,124 +76,114 @@ def get_implied_ask_cents(ticker: str, side: str) -> int:
 
     if side == "yes":
         if not no_bids:
-            raise RuntimeError("No NO bids available to infer YES ask")
-        best_no_bid_dollars = float(no_bids[-1][0])
-        ask_cents = int(round((1.0 - best_no_bid_dollars) * 100))
+            raise RuntimeError("No NO bids available")
+        best_no_bid = float(no_bids[-1][0])
+        ask_cents = int(round((1.0 - best_no_bid) * 100))
     else:
         if not yes_bids:
-            raise RuntimeError("No YES bids available to infer NO ask")
-        best_yes_bid_dollars = float(yes_bids[-1][0])
-        ask_cents = int(round((1.0 - best_yes_bid_dollars) * 100))
+            raise RuntimeError("No YES bids available")
+        best_yes_bid = float(yes_bids[-1][0])
+        ask_cents = int(round((1.0 - best_yes_bid) * 100))
 
     return max(1, min(99, ask_cents))
 
-def calculate_count_for_budget(ask_cents: int) -> int:
+def calculate_count_for_budget(ask_cents: int):
     return max(1, math.floor(BUY_MAX_COST_CENTS / ask_cents))
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "state": STATE})
 
 @app.route("/trade", methods=["POST"])
 def trade():
-    data = request.get_json(force=True) or {}
-    action = data.get("action")
-
-    if action not in {"buy_yes", "buy_no"}:
-        return jsonify({"ok": False, "error": "bad action"}), 400
-
-    side = "yes" if action == "buy_yes" else "no"
-    bucket = current_15m_bucket()
-
-    if STATE["bucket"] != bucket:
-        STATE["bucket"] = bucket
-        STATE["traded"] = False
-        STATE["side"] = None
-
-    # HARD LOCK: one trade total per 15m bucket
-    if STATE["traded"]:
-        return jsonify({
-            "ok": True,
-            "blocked": True,
-            "reason": "already traded this 15m bucket",
-            "bucket": bucket,
-            "locked_side": STATE["side"],
-            "requested_side": side
-        }), 200
-
     try:
+        data = request.get_json(force=True) or {}
+        action = data.get("action")
+
+        if action not in {"buy_yes", "buy_no"}:
+            return jsonify({"ok": False, "error": "bad action"}), 400
+
+        side = "yes" if action == "buy_yes" else "no"
+        bucket = current_15m_bucket()
+
+        if STATE["bucket"] != bucket:
+            STATE["bucket"] = bucket
+            STATE["traded"] = False
+            STATE["side"] = None
+
+        if STATE["traded"]:
+            return jsonify({
+                "ok": True,
+                "blocked": True,
+                "reason": "already traded this 15m bucket",
+                "bucket": bucket,
+                "locked_side": STATE["side"],
+                "requested_side": side
+            }), 200
+
         ticker = get_current_ticker()
         ask_cents = get_implied_ask_cents(ticker, side)
         count = calculate_count_for_budget(ask_cents)
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "stage": "prep",
-            "error": str(e)
-        }), 500
 
-    payload = {
-        "ticker": ticker,
-        "action": "buy",
-        "side": side,
-        "count": count,
-        "client_order_id": str(uuid.uuid4()),
-        "time_in_force": "fill_or_kill",
-        "buy_max_cost": BUY_MAX_COST_CENTS
-    }
+        payload = {
+            "ticker": ticker,
+            "action": "buy",
+            "side": side,
+            "count": count,
+            "client_order_id": str(uuid.uuid4()),
+            "time_in_force": "fill_or_kill",
+            "buy_max_cost": BUY_MAX_COST_CENTS
+        }
 
-    if side == "yes":
-        payload["yes_price"] = ask_cents
-    else:
-        payload["no_price"] = ask_cents
+        if side == "yes":
+            payload["yes_price"] = ask_cents
+        else:
+            payload["no_price"] = ask_cents
 
-    path = "/portfolio/orders"
-
-    try:
+        path = "/portfolio/orders"
         r = requests.post(
             BASE + path,
             json=payload,
             headers=headers("POST", path),
             timeout=5
         )
+
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+
+        if not r.ok:
+            return jsonify({
+                "ok": False,
+                "stage": "kalshi",
+                "status_code": r.status_code,
+                "ticker": ticker,
+                "payload": payload,
+                "body": body
+            }), 200
+
+        STATE["traded"] = True
+        STATE["side"] = side
+
+        return jsonify({
+            "ok": True,
+            "blocked": False,
+            "bucket": bucket,
+            "ticker": ticker,
+            "side": side,
+            "ask_cents": ask_cents,
+            "count": count,
+            "payload": payload,
+            "body": body
+        }), 200
+
     except Exception as e:
         return jsonify({
             "ok": False,
-            "stage": "request",
-            "ticker": ticker,
-            "payload": payload,
+            "stage": "python",
             "error": str(e)
-        }), 500
-
-    try:
-        body = r.json()
-    except Exception:
-        body = {"raw": r.text}
-
-    if not r.ok:
-        return jsonify({
-            "ok": False,
-            "stage": "kalshi",
-            "status_code": r.status_code,
-            "ticker": ticker,
-            "payload": payload,
-            "body": body
-        }), 500
-
-    STATE["traded"] = True
-    STATE["side"] = side
-
-    return jsonify({
-        "ok": True,
-        "blocked": False,
-        "bucket": bucket,
-        "ticker": ticker,
-        "side": side,
-        "ask_cents": ask_cents,
-        "count": count,
-        "payload": payload,
-        "body": body
-    }), 200
+        }), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
