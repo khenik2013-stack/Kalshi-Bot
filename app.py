@@ -16,15 +16,13 @@ KEY_ID = os.getenv("KALSHI_API_KEY_ID")
 KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM", "").replace("\\n", "\n").strip()
 SERIES = os.getenv("KALSHI_SERIES_PREFIX", "KXBTC15M")
 
-# $10 max spend each trigger
-BUY_MAX_COST_CENTS = 1000
+BUY_MAX_COST_CENTS = 1000  # $10 max per trade
 
 PRIVATE_KEY = serialization.load_pem_private_key(
     KEY_PEM.encode(),
     password=None
 )
 
-# In-memory lock for current 15m window
 STATE = {
     "bucket": None,
     "side": None,
@@ -65,11 +63,11 @@ def get_current_ticker():
     markets = data.get("markets", [])
     if not markets:
         raise RuntimeError("No open BTC 15m markets found")
+
     markets.sort(key=lambda x: x.get("close_time", "9999"))
     return markets[0]["ticker"]
 
 def get_implied_ask_cents(ticker: str, side: str) -> int:
-    # Orderbook returns only bids; implied asks come from opposite-side best bid
     r = requests.get(f"{BASE}/markets/{ticker}/orderbook", timeout=5)
     r.raise_for_status()
     data = r.json()
@@ -80,20 +78,17 @@ def get_implied_ask_cents(ticker: str, side: str) -> int:
     if side == "yes":
         if not no_bids:
             raise RuntimeError("No NO bids available to infer YES ask")
-        best_no_bid_dollars = float(no_bids[-1][0])   # highest NO bid
+        best_no_bid_dollars = float(no_bids[-1][0])
         ask_cents = int(round((1.0 - best_no_bid_dollars) * 100))
     else:
         if not yes_bids:
             raise RuntimeError("No YES bids available to infer NO ask")
-        best_yes_bid_dollars = float(yes_bids[-1][0]) # highest YES bid
+        best_yes_bid_dollars = float(yes_bids[-1][0])
         ask_cents = int(round((1.0 - best_yes_bid_dollars) * 100))
 
-    # Kalshi valid price range is 1..99
-    ask_cents = max(1, min(99, ask_cents))
-    return ask_cents
+    return max(1, min(99, ask_cents))
 
-def calculate_count_for_10_dollars(ask_cents: int) -> int:
-    # whole contracts only
+def calculate_count_for_budget(ask_cents: int) -> int:
     return max(1, math.floor(BUY_MAX_COST_CENTS / ask_cents))
 
 @app.route("/health", methods=["GET"])
@@ -111,28 +106,30 @@ def trade():
     side = "yes" if action == "buy_yes" else "no"
     bucket = current_15m_bucket()
 
-    # Reset lock on new 15m window
     if STATE["bucket"] != bucket:
         STATE["bucket"] = bucket
         STATE["side"] = None
 
-    # Block opposite side in same 15m bucket
     if STATE["side"] is not None and STATE["side"] != side:
         return jsonify({
-            "ok": False,
+            "ok": True,
             "blocked": True,
             "reason": "opposite side blocked until next 15m window",
             "bucket": bucket,
             "locked_side": STATE["side"],
             "requested_side": side
-        }), 409
+        }), 200
 
     try:
         ticker = get_current_ticker()
         ask_cents = get_implied_ask_cents(ticker, side)
-        count = calculate_count_for_10_dollars(ask_cents)
+        count = calculate_count_for_budget(ask_cents)
     except Exception as e:
-        return jsonify({"ok": False, "stage": "prep", "error": str(e)}), 500
+        return jsonify({
+            "ok": False,
+            "stage": "prep",
+            "error": str(e)
+        }), 500
 
     payload = {
         "ticker": ticker,
@@ -141,10 +138,9 @@ def trade():
         "count": count,
         "client_order_id": str(uuid.uuid4()),
         "time_in_force": "fill_or_kill",
-        "buy_max_cost": BUY_MAX_COST_CENTS,
+        "buy_max_cost": BUY_MAX_COST_CENTS
     }
 
-    # marketable limit
     if side == "yes":
         payload["yes_price"] = ask_cents
     else:
@@ -183,11 +179,11 @@ def trade():
             "body": body
         }), 500
 
-    # lock side after first successful order in this 15m bucket
     STATE["side"] = side
 
     return jsonify({
         "ok": True,
+        "blocked": False,
         "bucket": bucket,
         "ticker": ticker,
         "side": side,
