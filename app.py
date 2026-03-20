@@ -16,7 +16,7 @@ KEY_ID = os.getenv("KALSHI_API_KEY_ID")
 KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY_PEM", "").replace("\\n", "\n").strip()
 SERIES = os.getenv("KALSHI_SERIES_PREFIX", "KXBTC15M")
 
-BUY_MAX_COST_CENTS = 1000  # $10 max per trade
+BUY_MAX_COST_CENTS = 1000  # $10 max per 15m bucket
 
 PRIVATE_KEY = serialization.load_pem_private_key(
     KEY_PEM.encode(),
@@ -25,6 +25,7 @@ PRIVATE_KEY = serialization.load_pem_private_key(
 
 STATE = {
     "bucket": None,
+    "traded": False,
     "side": None,
 }
 
@@ -108,13 +109,15 @@ def trade():
 
     if STATE["bucket"] != bucket:
         STATE["bucket"] = bucket
+        STATE["traded"] = False
         STATE["side"] = None
 
-    if STATE["side"] is not None and STATE["side"] != side:
+    # HARD LOCK: one trade total per 15m bucket
+    if STATE["traded"]:
         return jsonify({
             "ok": True,
             "blocked": True,
-            "reason": "opposite side blocked until next 15m window",
+            "reason": "already traded this 15m bucket",
             "bucket": bucket,
             "locked_side": STATE["side"],
             "requested_side": side
@@ -179,6 +182,7 @@ def trade():
             "body": body
         }), 500
 
+    STATE["traded"] = True
     STATE["side"] = side
 
     return jsonify({
